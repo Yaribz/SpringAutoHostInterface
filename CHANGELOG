@@ -1,0 +1,22 @@
+SpringAutoHostInterface.pm:
+==========================
+0.4: first public version (beta)
+0.4a: typo in error message
+0.4b: change "destination" parameter values for PLAYER_CHAT callbacks (now it can be "", "spectators", "allies" or "<playerName>")
+0.4c: do not consider control characters as end of string indicators, this should fix chat messages with no author in battle lobby ("<>")
+0.5: SERVER_MESSAGE commands are now parsed to detect loading users (PLAYER_JOINED commands are only sent when players finish loading)
+       (this should fix some "unknown player number" errors)
+0.5a: add new destination constants for chat messages of next Spring release
+0.6: support for GAME_LUAMSG message (should fix the 'Unknown command code "20"' errors)
+0.6a: update for new client connection server message syntax
+0.6b: support for GAME_TEAMSTAT message (should fix the 'Unknown command code "60"' errors)
+0.6c: adjust "Connection established" case message for Spring 0.82.3
+0.6d: minor change to handle "Loading" state during midgame reconnections
+0.6e: added support for new SERVER_GAMEOVER parameters (should fix the "Control character xxx encountered while parsing a string received from spring server" warnings)
+0.6f: GAME_TEAMSTAT parameters are now unmarshalled by the module
+0.7: gameId and demoName are now sent in SERVER_STARTPLAYING messages (engine 89.0)
+0.7a: backward compatibility for engine < 89
+0.8: added "pre-callback" functionnality (executed before the module internal handlers)
+     global pre-callbacks can be added to handle all commands in same function
+     multiple callbacks can now be added for each command, with optional priority parameter
+0.9: renamed from PerlAutoHostInterface to SpringAutoHostInterface
