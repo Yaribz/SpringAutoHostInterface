@@ -28,7 +28,7 @@ use SimpleLog;
 
 # Internal data ###############################################################
 
-my $moduleVersion='0.9';
+my $moduleVersion='0.10';
 
 my %commandCodes = (
   0 => 'SERVER_STARTED',
@@ -589,7 +589,8 @@ sub serverMessageHandler {
                                         lost => 0,
                                         version => $self->{connectingPlayer}->{version},
                                         address => $self->{connectingPlayer}->{address},
-                                        winningAllyTeams => undef };
+                                        winningAllyTeams => undef,
+                                        playerNb => $playerNb };
     }
     $self->{connectingPlayer}->{name}="";
     $self->{connectingPlayer}->{version}="";
@@ -615,7 +616,8 @@ sub playerJoinedHandler {
                                       lost => 0,
                                       version => '',
                                       address => '',
-                                      winningAllyTeams => undef };
+                                      winningAllyTeams => undef,
+                                      playerNb => $playerNb };
   }
   return 1;
 }

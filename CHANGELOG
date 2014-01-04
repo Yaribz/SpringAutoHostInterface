@@ -20,3 +20,4 @@ SpringAutoHostInterface.pm:
      global pre-callbacks can be added to handle all commands in same function
      multiple callbacks can now be added for each command, with optional priority parameter
 0.9: renamed from PerlAutoHostInterface to SpringAutoHostInterface
+0.10: make player number easily accessible in player data structure
