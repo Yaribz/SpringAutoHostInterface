@@ -1,7 +1,7 @@
 # Object-oriented Perl module implementing a callback-based interface to
 # communicate with SpringRTS engine through autohost interface.
 #
-# Copyright (C) 2008-2013  Yann Riou <yaribzh@gmail.com>
+# Copyright (C) 2008-2015  Yann Riou <yaribzh@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -28,7 +28,7 @@ use SimpleLog;
 
 # Internal data ###############################################################
 
-my $moduleVersion='0.10';
+my $moduleVersion='0.11';
 
 my %commandCodes = (
   0 => 'SERVER_STARTED',
@@ -105,9 +105,10 @@ sub new {
   #   2 -> kicked
   #
   # Player ready states:
-  #   0 -> not ready
-  #   1 -> ready
-  #   2 -> unknown
+  #   -1 -> default (not placed, not ready)
+  #   0 -> updated (placed but not ready)
+  #   1 -> readied (manually)
+  #   2 -> readied (through LUA)
 
   my $self = {
     conf => $p_conf,
@@ -585,7 +586,7 @@ sub serverMessageHandler {
     }else{
       $self->{players}->{$playerNb} = { name => $self->{connectingPlayer}->{name},
                                         disconnectCause => -2,
-                                        ready => 2,
+                                        ready => -1,
                                         lost => 0,
                                         version => $self->{connectingPlayer}->{version},
                                         address => $self->{connectingPlayer}->{address},
@@ -612,7 +613,7 @@ sub playerJoinedHandler {
   }else{
     $self->{players}->{$playerNb} = { name => $name,
                                       disconnectCause => -1,
-                                      ready => 2,
+                                      ready => -1,
                                       lost => 0,
                                       version => '',
                                       address => '',
@@ -640,7 +641,7 @@ sub playerReadyHandler {
   my %conf=%{$self->{conf}};
   my $sl=$conf{simpleLog};
   if(exists $self->{players}->{$playerNb}) {
-    $self->{players}->{$playerNb}->{ready}=$readyState if($readyState != 2);
+    $self->{players}->{$playerNb}->{ready}=$readyState;
   }else{
     $sl->log("Ignoring PLAYER_READY message on AutoHost interface (unknown player number $playerNb)",1);
   }
