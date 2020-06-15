@@ -22,3 +22,4 @@ SpringAutoHostInterface.pm:
 0.9: renamed from PerlAutoHostInterface to SpringAutoHostInterface
 0.10: make player number easily accessible in player data structure
 0.11: added support for new PLAYER_READY states
+0.12: fix support for ~ prefix automatically added by Spring engine in player names

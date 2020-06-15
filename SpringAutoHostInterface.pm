@@ -1,7 +1,7 @@
 # Object-oriented Perl module implementing a callback-based interface to
 # communicate with SpringRTS engine through autohost interface.
 #
-# Copyright (C) 2008-2015  Yann Riou <yaribzh@gmail.com>
+# Copyright (C) 2008-2020  Yann Riou <yaribzh@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -28,7 +28,7 @@ use SimpleLog;
 
 # Internal data ###############################################################
 
-my $moduleVersion='0.11';
+my $moduleVersion='0.12';
 
 my %commandCodes = (
   0 => 'SERVER_STARTED',
@@ -576,6 +576,9 @@ sub serverMessageHandler {
   }elsif($msg =~ /^ -> Connection established \(given id (\d+)\)$/) {
     my $playerNb=$1;
     if(exists $self->{players}->{$playerNb}) {
+      if($self->{players}{$playerNb}{name} eq '~'.$self->{connectingPlayer}{name}) {
+        $self->{connectingPlayer}{name}='~'.$self->{connectingPlayer}{name};
+      }
       if($self->{connectingPlayer}->{name} ne $self->{players}->{$playerNb}->{name}) {
         $sl->log("Received a SERVER_MESSAGE command saying player \#$playerNb was $self->{connectingPlayer}->{name}, whereas PLAYER_JOINED said it was $self->{players}->{$playerNb}->{name}",1);
       }else{
@@ -605,6 +608,9 @@ sub playerJoinedHandler {
   my %conf=%{$self->{conf}};
   my $sl=$conf{simpleLog};
   if(exists $self->{players}->{$playerNb}) {
+    if($name eq '~'.$self->{players}{$playerNb}{name}) {
+      $self->{players}{$playerNb}{name}='~'.$self->{players}{$playerNb}{name};
+    }
     if($name ne $self->{players}->{$playerNb}->{name}) {
       $sl->log("Received a PLAYER_JOINED command saying player \#$playerNb was $name, whereas SERVER_MESSAGE said it was $self->{players}->{$playerNb}->{name}",1);
     }else{
