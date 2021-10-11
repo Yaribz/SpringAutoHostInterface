@@ -28,7 +28,7 @@ use SimpleLog;
 
 # Internal data ###############################################################
 
-my $moduleVersion='0.12';
+my $moduleVersion='0.13';
 
 my %commandCodes = (
   0 => 'SERVER_STARTED',
@@ -427,6 +427,22 @@ sub sendChatMessage {
   my $autoHostSock=$self->{autoHostSock};
   $autoHostSock->send("$message");
   $sl->log("Sent on AutoHost interface: \"$message\"",5);
+  if($message =~ /^\/([^ ]+)(?: +(.+))?$/) {
+    my ($cmd,$param)=(uc($1),$2);
+    if(exists($self->{callbacks}{"HOOK_$cmd"})) {
+      foreach my $prio (sort prioSort (keys %{$self->{callbacks}{"HOOK_$cmd"}})) {
+        my ($callback,$nbCalls)=@{$self->{callbacks}{"HOOK_$cmd"}{$prio}};
+        if($nbCalls == 1) {
+          delete $self->{callbacks}{"HOOK_$cmd"}{$prio};
+        }elsif($nbCalls > 1) {
+          $nbCalls-=1;
+          $self->{callbacks}{"HOOK_$cmd"}{$prio}=[$callback,$nbCalls];
+        }
+        &{$callback}($cmd,$param) if($callback);
+      }
+      delete $self->{callbacks}{"HOOK_$cmd"} unless(%{$self->{callbacks}{"HOOK_$cmd"}});
+    }
+  }
   return 1;
 }
 
@@ -524,7 +540,7 @@ sub checkGameOver {
   $self->{state}=3 if($nbOver > $nbInProgress);
 }
 
-# Internal handlers and hooks #################################################
+# Internal handlers ###########################################################
 
 sub serverStartedHandler {
   my $self=shift;
