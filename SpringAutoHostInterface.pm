@@ -21,6 +21,7 @@ package SpringAutoHostInterface;
 
 use strict;
 
+use Encode qw'decode encode';
 use IO::Socket::INET;
 use Storable "dclone";
 
@@ -28,7 +29,7 @@ use SimpleLog;
 
 # Internal data ###############################################################
 
-my $moduleVersion='0.13';
+my $moduleVersion='0.14';
 
 my %commandCodes = (
   0 => 'SERVER_STARTED',
@@ -308,18 +309,9 @@ sub unmarshallBytes {
 
 sub unmarshallStringFromBytes {
   my ($self,$p_bytes)=@_;
-  my %conf=%{$self->{conf}};
-  my $sl=$conf{simpleLog};
-  my $string="";
-  while(@{$p_bytes}) {
-    my $charCode=shift(@{$p_bytes});
-    if($charCode > 31) {
-      $string.=chr($charCode);
-    }else{
-      $string.="_";
-      $sl->log("Control character #$charCode encountered while parsing a string received from spring server",2);
-    }
-  }
+  return '' unless(@{$p_bytes});
+  my $string=decode('utf-8',pack('C*',@{$p_bytes}));
+  @{$p_bytes}=();
   return $string;
 }
 
@@ -425,7 +417,7 @@ sub sendChatMessage {
     return 0;
   }
   my $autoHostSock=$self->{autoHostSock};
-  $autoHostSock->send("$message");
+  $autoHostSock->send(encode('utf-8',$message));
   $sl->log("Sent on AutoHost interface: \"$message\"",5);
   if($message =~ /^\/([^ ]+)(?: +(.+))?$/) {
     my ($cmd,$param)=(uc($1),$2);
@@ -475,7 +467,10 @@ sub receiveCommand {
     $sl->log("Empty message received on AutoHost interface",2);
     return 0;
   }
-  $sl->log("Received from Game server: \"$recvBuf\"",5);
+  {
+    no warnings 'utf8';
+    $sl->log("Received from Game server: \"$recvBuf\"",5);
+  }
   my $p_commands=$self->unmarshallCommands($recvBuf);
   my $rc=1;
   for my $cIndex (0..$#{$p_commands}) {
@@ -520,7 +515,10 @@ sub receiveCommand {
     }
 
     if(! $processed && $conf{warnForUnhandledMessages}) {
-      $sl->log("Unexpected/unhandled command received: \"$recvBuf\"",2);
+      {
+        no warnings 'utf8';
+        $sl->log("Unexpected/unhandled command received: \"$recvBuf\"",2);
+      }
       $rc=0;
     }
   }

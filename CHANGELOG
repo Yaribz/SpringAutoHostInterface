@@ -24,3 +24,4 @@ SpringAutoHostInterface.pm:
 0.11: added support for new PLAYER_READY states
 0.12: fix support for ~ prefix automatically added by Spring engine in player names
 0.13: added support for callbacks on commands sent to Spring server (hooks)
+0.14: use UTF-8 when communicating with game server
