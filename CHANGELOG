@@ -25,3 +25,13 @@ SpringAutoHostInterface.pm:
 0.12: fix support for ~ prefix automatically added by Spring engine in player names
 0.13: added support for callbacks on commands sent to Spring server (hooks)
 0.14: use UTF-8 when communicating with game server
+0.15: backward compatibility breaking changes regarding SERVER_GAMEOVER handlers: the "msgSize" parameter is removed and the "winningAllyTeam" parameter is now an array reference
+      backward compatibility breaking change regarding PLAYER_CHAT handlers: the "destination" parameter is no longer pre-processed (it is now the numerical value exactly as it was transmitted by the engine)
+      new accessors: getPlayerName and getPlayerByNum
+      increase the read buffer size to match the default Linux localhost MTU (GAME_TEAMSTATS messages with about 50 players/teams could exceed the previous size)
+      fix SERVER_GAMEOVER messages coming from unknown players not being ignored (despite the log message saying so)
+      fix read error cases being handled as empty message cases
+      remove useless handling of multiplexed messages (only one message can be received at a time)
+      use constants to ease handling of server states, clients states, players ready states, and specific parameter values for engine messages
+      factorize and improve unmarshalling code (avoid unneeded conversion to array of bytes and superfluous packing/unpacking operations, add checks on message length)
+      remove superfluous dereference operators

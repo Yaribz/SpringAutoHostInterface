@@ -1,7 +1,7 @@
 # Object-oriented Perl module implementing a callback-based interface to
 # communicate with SpringRTS engine through autohost interface.
 #
-# Copyright (C) 2008-2020  Yann Riou <yaribzh@gmail.com>
+# Copyright (C) 2008-2026  Yann Riou <yaribzh@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,41 +20,145 @@
 package SpringAutoHostInterface;
 
 use strict;
+use warnings;
 
 use Encode qw'decode encode';
 use IO::Socket::INET;
 use Storable "dclone";
 
+use base 'Exporter';
+
+our %EXPORT_TAGS = (
+  srvState => [qw'SRV_STATE_NOT_RUNNING SRV_STATE_SERVER_STARTED SRV_STATE_GAME_STARTED SRV_STATE_GAME_OVER'],
+  cliState => [qw'CLI_STATE_LOADING CLI_STATE_CONNECTED CLI_STATE_CONNECTION_LOST CLI_STATE_LEFT CLI_STATE_KICKED'],
+  rdyState => [qw'RDY_STATE_NOT_PLACED RDY_STATE_PLACED RDY_STATE_READY_BY_ENGINE RDY_STATE_READY_BY_LUA'],
+  msgDest => [qw'MSG_DEST_ALLIES MSG_DEST_SPECTATORS MSG_DEST_EVERYONE MSG_DEST_SERVER'],
+  luaScript => [qw'LUA_SCRIPT_RULES LUA_SCRIPT_GAIA LUA_SCRIPT_UI'],
+  luaMode => [qw'LUA_MODE_ALL LUA_MODE_ALLIES LUA_MODE_SPECTATORS'],
+    );
+
+push(@{$EXPORT_TAGS{all}},@{$EXPORT_TAGS{$_}}) foreach(keys %EXPORT_TAGS);
+Exporter::export_ok_tags('all');
+
 use SimpleLog;
+
+# Internal constants
+use constant {
+  MTU_LOCALHOST => 65536,
+
+  NETMSG_LUAMSG => 50,
+
+  MSGSIZE_EXCLUDES_CMDCODE => 0,
+  MSGSIZE_INCLUDES_CMDCODE => 1,
+};
+
+# Exported constants
+use constant {
+  SRV_STATE_NOT_RUNNING => 0,
+  SRV_STATE_SERVER_STARTED => 1,
+  SRV_STATE_GAME_STARTED => 2,
+  SRV_STATE_GAME_OVER => 3,
+  
+  CLI_STATE_LOADING => -2,
+  CLI_STATE_CONNECTED => -1,
+  CLI_STATE_CONNECTION_LOST => 0,
+  CLI_STATE_LEFT => 1,
+  CLI_STATE_KICKED => 2,
+
+  RDY_STATE_NOT_PLACED => -1,
+  RDY_STATE_PLACED => 0,
+  RDY_STATE_READY_BY_ENGINE => 1,
+  RDY_STATE_READY_BY_LUA => 2,
+
+  MSG_DEST_ALLIES => 252,
+  MSG_DEST_SPECTATORS => 253,
+  MSG_DEST_EVERYONE => 254,
+  MSG_DEST_SERVER => 255,
+
+  LUA_SCRIPT_RULES => 100,
+  LUA_SCRIPT_GAIA => 300,
+  LUA_SCRIPT_UI => 2000,
+
+  LUA_MODE_ALL => 0,
+  LUA_MODE_ALLIES => ord('a'),
+  LUA_MODE_SPECTATORS => ord('s'),
+};
 
 # Internal data ###############################################################
 
-my $moduleVersion='0.14';
+our $VERSION='0.15';
 
-my %commandCodes = (
-  0 => 'SERVER_STARTED',
-  1 => 'SERVER_QUIT',
-  2 => 'SERVER_STARTPLAYING',
-  3 => 'SERVER_GAMEOVER',
-  4 => 'SERVER_MESSAGE',
-  5 => 'SERVER_WARNING',
-  10 => 'PLAYER_JOINED',
-  11 => 'PLAYER_LEFT',
-  12 => 'PLAYER_READY',
-  13 => 'PLAYER_CHAT',
-  14 => 'PLAYER_DEFEATED',
-  20 => 'GAME_LUAMSG',
-  60 => 'GAME_TEAMSTAT'
-);
-
-my %destinations = (
-  125 => '',
-  126 => 'spectators',
-  127 => 'allies',
-  252 => 'allies',
-  253 => 'spectators',
-  254 => ''
-);
+my %commandTypes = (
+  0 => {
+    name => 'SERVER_STARTED',
+    paramSize => 0,
+  },
+  1 => {
+    name => 'SERVER_QUIT',
+    paramSize => 0,
+  },
+  2 => {
+    name => 'SERVER_STARTPLAYING',
+    minParamSize => 20,
+    paramTemplate => 'V H32 a*',     # (uint32 msgSize,) uint8[16] gameId, char[] demoName
+    utf8ParamIdx => 1,
+    msgSizeMode => MSGSIZE_INCLUDES_CMDCODE,
+  },
+  3 => {
+    name => 'SERVER_GAMEOVER',
+    minParamSize => 2,
+    paramTemplate => 'C*',           # (uint8 msgSize,) uint8 playerNum, uint8[] winningAllyTeamss
+    msgSizeMode => MSGSIZE_INCLUDES_CMDCODE,
+  },
+  4 => {
+    name => 'SERVER_MESSAGE',
+    minParamSize => 1,
+    utf8ParamIdx => 0,               # char[] message
+  },
+  5 => {
+    name => 'SERVER_WARNING',
+    minParamSize => 1,
+    utf8ParamIdx => 0,               # char[] warningMessage
+  },
+  10 => {
+    name => 'PLAYER_JOINED',
+    minParamSize => 2,
+    paramTemplate => 'C a*',         # uint8 playerNum, char[] name
+    utf8ParamIdx => 1,
+  },
+  11 => {
+    name => 'PLAYER_LEFT',
+    paramSize => 2,
+    paramTemplate => 'C2',           # uint8 playerNum, uint8 reason
+  },
+  12 => {
+    name => 'PLAYER_READY',
+    paramSize => 2,
+    paramTemplate => 'C2',           # uint8 playerNum, uint8 state
+  },
+  13 => {
+    name => 'PLAYER_CHAT',
+    minParamSize => 3,
+    paramTemplate => 'C2 a*',        # uint8 playerNum, uint8 destination, char[] text
+    utf8ParamIdx => 2,
+  },
+  14 => {
+    name => 'PLAYER_DEFEATED',
+    paramSize => 1,
+    paramTemplate => 'C',            # uint8 playerNum
+  },
+  20 => {
+    name => 'GAME_LUAMSG',
+    minParamSize => 7,
+    paramTemplate => 'C v C v C a*', # (uint8 NETMSG_LUAMSG, uint16 msgSize,) uint8 playerNum, uint16 script, uint8 mode, uint8[] data
+    msgSizeMode => MSGSIZE_EXCLUDES_CMDCODE,
+  },
+  60 => {
+    name => 'GAME_TEAMSTAT',
+    paramSize => 81,
+    paramTemplate => 'C l< f12 l<7', # uint8 teamNum, TeamStatistics stats
+  },
+    );
 
 my %commandHandlers = (
   SERVER_STARTED => \&serverStartedHandler,
@@ -92,35 +196,16 @@ sub new {
     $p_conf->{simpleLog}=SimpleLog->new(prefix => "[SpringAutoHostInterface] ");
   }
 
-  # Server states:
-  #   0 -> not running
-  #   1 -> server started
-  #   2 -> game started
-  #   3 -> game over
-  #
-  # Player disconnect causes:
-  #   -2 -> loading
-  #   -1 -> connected
-  #   0 -> connection lost
-  #   1 -> player left
-  #   2 -> kicked
-  #
-  # Player ready states:
-  #   -1 -> default (not placed, not ready)
-  #   0 -> updated (placed but not ready)
-  #   1 -> readied (manually)
-  #   2 -> readied (through LUA)
-
   my $self = {
     conf => $p_conf,
     autoHostSock => undef,
-    state => 0,
+    state => SRV_STATE_NOT_RUNNING,
     gameId => '',
     demoName => '',
     players => {},
     callbacks => {},
     preCallbacks => {},
-    connectingPlayer => { name => "", version => "", address => "" }
+    connectingPlayer => { name => '', version => '', address => '' }
   };
 
   bless ($self, $class);
@@ -129,9 +214,31 @@ sub new {
 
 # Accessors ###################################################################
 
+sub getVersion {
+  return $VERSION;
+}
+
 sub getState {
   my $self = shift;
   return $self->{state};
+}
+
+sub getPlayerName {
+  my ($self,$playerNb)=@_;
+  return exists $self->{players}{$playerNb} ? $self->{players}{$playerNb}{name} : undef;
+}
+
+sub getPlayer {
+  my ($self,$name)=@_;
+  foreach my $playerNb (keys %{$self->{players}}) {
+    return $self->{players}{$playerNb} if($self->{players}{$playerNb}{name} eq $name);
+  }
+  return {};
+}
+
+sub getPlayerByNum {
+  my ($self,$playerNb)=@_;
+  return $self->{players}{$playerNb};
 }
 
 sub getPlayers {
@@ -143,21 +250,9 @@ sub getPlayersByNames {
   my $self = shift;
   my %playersByNames;
   foreach my $playerNb (keys %{$self->{players}}) {
-    $playersByNames{$self->{players}->{$playerNb}->{name}}=dclone($self->{players}->{$playerNb});
+    $playersByNames{$self->{players}{$playerNb}{name}}=dclone($self->{players}{$playerNb});
   }
   return \%playersByNames;
-}
-
-sub getVersion {
-  return $moduleVersion;
-}
-
-sub getPlayer {
-  my ($self,$name)=@_;
-  foreach my $playerNb (keys %{$self->{players}}) {
-    return $self->{players}->{$playerNb} if($self->{players}->{$playerNb}->{name} eq $name);
-  }
-  return {};
 }
 
 # Debugging method ############################################################
@@ -170,149 +265,76 @@ sub dumpState {
   $sl->log("State:$self->{state}",5);
   $sl->log("Players:",5);
   foreach my $pId (keys %{$self->{players}}) {
-    my $pHash=$self->{players}->{$pId};
+    my $pHash=$self->{players}{$pId};
     $sl->log("  $pId: name=$pHash->{name},ready=$pHash->{ready},lost=$pHash->{lost},disconnectCause=$pHash->{disconnectCause},version=$pHash->{version}",5);
   }
   $sl->log("--------------------------- END OF DUMP -----------------------------",5);
 }
 
+sub paramToString { ref $_[0] eq 'ARRAY' ? '['.join(',',@{$_[0]}).']' : $_[0] }
+
 # Marshallers/unmarshallers ###################################################
 
-sub unmarshallCommands {
+sub unmarshallCommand {
   my ($self,$marshalled)=@_;
-  my %conf=%{$self->{conf}};
-  my $sl=$conf{simpleLog};
-  my @bytes=unpack("C*",$marshalled);
-  return $self->unmarshallBytes(\@bytes);
-}
 
-sub unmarshallBytes {
-  my ($self,$p_bytes)=@_;
-  my %conf=%{$self->{conf}};
-  my $sl=$conf{simpleLog};
-  return [] unless(@{$p_bytes});
-  my $commandCode=shift(@{$p_bytes});
-  if(exists $commandCodes{$commandCode}) {
-    my $commandName=$commandCodes{$commandCode};
-    my @command=($commandName);
-    if($commandName eq "PLAYER_JOINED") {
-      my $playerNb=shift(@{$p_bytes});
-      if(! (defined $playerNb)) {
-        $sl->log("Unable to unmarshall PLAYER_JOINED command (incomplete command)",1);
-        return [];
-      }
-      push(@command,$playerNb);
-      push(@command,$self->unmarshallStringFromBytes($p_bytes));
-    }elsif($commandName eq "PLAYER_LEFT") {
-      my $playerNb=shift(@{$p_bytes});
-      if(! (defined $playerNb)) {
-        $sl->log("Unable to unmarshall PLAYER_LEFT command (incomplete command)",1);
-        return [];
-      }
-      my $reason=shift(@{$p_bytes});
-      if(! (defined $reason)) {
-        $sl->log("Unable to unmarshall PLAYER_LEFT command (incomplete command)",1);
-        return [];
-      }
-      push(@command,$playerNb,$reason);
-    }elsif($commandName eq "PLAYER_READY") {
-      my $playerNb=shift(@{$p_bytes});
-      if(! (defined $playerNb)) {
-        $sl->log("Unable to unmarshall PLAYER_READY command (incomplete command)",1);
-        return [];
-      }
-      my $state=shift(@{$p_bytes});
-      if(! (defined $state)) {
-        $sl->log("Unable to unmarshall PLAYER_READY command (incomplete command)",1);
-        return [];
-      }
-      push(@command,$playerNb,$state);
-    }elsif($commandName eq "PLAYER_CHAT") {
-      my $playerNb=shift(@{$p_bytes});
-      if(! (defined $playerNb)) {
-        $sl->log("Unable to unmarshall PLAYER_CHAT command (incomplete command)",1);
-        return [];
-      }
-      push(@command,$playerNb);
-      my $dest=shift(@{$p_bytes});
-      $dest="" unless(defined $dest);
-      if(exists $destinations{$dest}) {
-        $dest=$destinations{$dest};
-      }elsif(exists $self->{players}->{$dest}) {
-        $dest=$self->{players}->{$dest}->{name};
-      }
-      push(@command,$dest);
-      push(@command,$self->unmarshallStringFromBytes($p_bytes));
-    }elsif($commandName eq "PLAYER_DEFEATED") {
-      my $playerNb=shift(@{$p_bytes});
-      if(! (defined $playerNb)) {
-        $sl->log("Unable to unmarshall PLAYER_DEFEATED command (incomplete command)",1);
-        return [];
-      }
-      push(@command,$playerNb);
-    }elsif($commandName eq "SERVER_MESSAGE" || $commandName eq "SERVER_WARNING") {
-      push(@command,$self->unmarshallStringFromBytes($p_bytes));
-    }elsif($commandName eq "GAME_LUAMSG") {
-      # Drop extra characters (bug workaround ?)
-      for my $i (0..2) {
-        shift @{$p_bytes};
-      }
-      my $playerNb=shift(@{$p_bytes});
-      my $script1=shift(@{$p_bytes});
-      my $script2=shift(@{$p_bytes});
-      my $mode=shift(@{$p_bytes});
-      if(! (defined $mode)) {
-        $sl->log("Unable to unmarshall GAME_LUAMSG command (incomplete command)",1);
-        return [];
-      }
-      my $script=$script2 * 256 + $script1;
-      $mode=chr($mode);
-      push(@command,$playerNb,$script,$mode,pack("C*",@{$p_bytes}));
-      $p_bytes=[];
-    }elsif($commandName eq 'GAME_TEAMSTAT') {
-      my $teamNb=shift(@{$p_bytes});
-      if(! (defined $teamNb)) {
-        $sl->log("Unable to unmarshall GAME_TEAMSTAT command (incomplete command)",1);
-        return [];
-      }
-      push(@command,$teamNb,unpack("If[12]I[7]",pack("C*",@{$p_bytes})));
-      $p_bytes=[];
-    }elsif($commandName eq 'SERVER_STARTPLAYING') {
-      my $hasParams;
-      for my $i (1..4) {
-        $hasParams=shift(@{$p_bytes});
-      }
-      if(defined $hasParams) {
-        my $gameId='';
-        for my $i (1..16) {
-          $gameId.=sprintf('%02x',shift(@{$p_bytes}));
-        }
-        my $demoName=$self->unmarshallStringFromBytes($p_bytes);
-        push(@command,$gameId,$demoName);
-      }
-    }elsif($commandName eq 'SERVER_GAMEOVER') {
-      my $msgSize=shift(@{$p_bytes});
-      my $playerNb=shift(@{$p_bytes});
-      my @winningAllyTeams;
-      for my $allyTeamIndex (1..($msgSize-3)) {
-        push(@winningAllyTeams,shift(@{$p_bytes}));
-      }
-      push(@command,$msgSize,$playerNb,@winningAllyTeams);
-    }
-    my $p_otherCommands=$self->unmarshallBytes($p_bytes);
-    return [\@command,@{$p_otherCommands}];
-  }else{
-    $sl->log("Unknown command code \"$commandCode\"",1);
+  my $sl=$self->{conf}{simpleLog};
+
+  my $commandCode=unpack('C',substr($marshalled,0,1,''));
+  my $r_cmdAttribs=$commandTypes{$commandCode};
+  if(! defined $r_cmdAttribs) {
+    $sl->log("Unable to unmarshall command, unknown command code \"$commandCode\"",1);
     return [];
   }
-}
+  my ($commandName,$minParamSize,$paramSize,$paramTemplate,$utf8ParamIdx,$msgSizeMode)=
+      @{$r_cmdAttribs}{qw'name minParamSize paramSize paramTemplate utf8ParamIdx msgSizeMode'};
 
-sub unmarshallStringFromBytes {
-  my ($self,$p_bytes)=@_;
-  return '' unless(@{$p_bytes});
-  my $string=decode('utf-8',pack('C*',@{$p_bytes}));
-  @{$p_bytes}=();
-  return $string;
+  my $paramLength=length($marshalled);
+  if(defined $minParamSize && $paramLength < $minParamSize) {
+    $sl->log("Unable to unmarshall $commandName command (incomplete command)",1);
+    return [];
+  }
+  if(defined $paramSize) {
+    if($paramLength < $paramSize) {
+      $sl->log("Unable to unmarshall $commandName command (incomplete command)",1);
+      return [];
+    }
+    $sl->log("Superfluous data in $commandName command parameter (expected size: $paramSize, actual size: $paramLength)",2)
+        if($paramLength > $paramSize);
+  }
+
+  my @cmdParams;
+  if(defined $paramTemplate) {
+    @cmdParams=unpack($paramTemplate,$marshalled);
+  }elsif(defined $utf8ParamIdx) {
+    @cmdParams=($marshalled);
+  }
+
+  if($commandName eq 'SERVER_GAMEOVER') {
+    my ($msgSize,$playerNum,@winningAllyTeams)=@cmdParams;
+    @cmdParams=($msgSize,$playerNum,\@winningAllyTeams);
+  }elsif($commandName eq 'GAME_LUAMSG') {
+    my $netMsgType=shift(@cmdParams);
+    if($netMsgType != NETMSG_LUAMSG) {
+      $sl->log("Invalid GAME_LUAMSG command, wrong network message type (expected NETMSG_LUAMSG=".NETMSG_LUAMSG.", got $netMsgType)",1);
+      return [];
+    }
+  }
+
+  if(defined $msgSizeMode) {
+    my $msgSize=shift(@cmdParams);
+    my $expectedSize=$paramLength+$msgSizeMode;
+    if($msgSize != $expectedSize) {
+      $sl->log("Invalid $commandName command, provided message size ($msgSize) does NOT match actual message size ($expectedSize)",1);
+      return [];
+    }
+  }
+
+  $cmdParams[$utf8ParamIdx]=decode('utf-8',$cmdParams[$utf8ParamIdx])
+      if(defined $utf8ParamIdx && defined $cmdParams[$utf8ParamIdx]);
+
+  unshift(@cmdParams,$commandName);
+  return \@cmdParams;
 }
 
 # Business functions ##########################################################
@@ -323,11 +345,11 @@ sub addCallbacks {
   $nbCalls=0 unless(defined $nbCalls);
   my %callbacks=%{$p_callbacks};
   foreach my $command (keys %callbacks) {
-    $self->{callbacks}->{$command}={} unless(exists $self->{callbacks}->{$command});
-    if(exists $self->{callbacks}->{$command}->{$priority}) {
-      $self->{conf}->{simpleLog}->log("Replacing an existing $command callback for priority \"$priority\"",2);
+    $self->{callbacks}{$command}={} unless(exists $self->{callbacks}{$command});
+    if(exists $self->{callbacks}{$command}{$priority}) {
+      $self->{conf}{simpleLog}->log("Replacing an existing $command callback for priority \"$priority\"",2);
     }
-    $self->{callbacks}->{$command}->{$priority}=[$callbacks{$command},$nbCalls];
+    $self->{callbacks}{$command}{$priority}=[$callbacks{$command},$nbCalls];
   }
 }
 
@@ -336,9 +358,9 @@ sub removeCallbacks {
   $priority=caller() unless(defined $priority);
   my @commands=@{$p_commands};
   foreach my $command (@commands) {
-    if(exists $self->{callbacks}->{$command}) {
-      delete $self->{callbacks}->{$command}->{$priority};
-      delete $self->{callbacks}->{$command} unless(%{$self->{callbacks}->{$command}});
+    if(exists $self->{callbacks}{$command}) {
+      delete $self->{callbacks}{$command}{$priority};
+      delete $self->{callbacks}{$command} unless(%{$self->{callbacks}{$command}});
     }
   }
 }
@@ -347,11 +369,11 @@ sub addPreCallbacks {
   my ($self,$p_preCallbacks,$priority)=@_;
   $priority=caller() unless(defined $priority);
   foreach my $command (keys %{$p_preCallbacks}) {
-    $self->{preCallbacks}->{$command}={} unless(exists $self->{preCallbacks}->{$command});
-    if(exists $self->{preCallbacks}->{$command}->{$priority}) {
-      $self->{conf}->{simpleLog}->log("Replacing an existing $command pre-callback for priority \"$priority\"",2);
+    $self->{preCallbacks}{$command}={} unless(exists $self->{preCallbacks}{$command});
+    if(exists $self->{preCallbacks}{$command}{$priority}) {
+      $self->{conf}{simpleLog}->log("Replacing an existing $command pre-callback for priority \"$priority\"",2);
     }
-    $self->{preCallbacks}->{$command}->{$priority}=$p_preCallbacks->{$command};
+    $self->{preCallbacks}{$command}{$priority}=$p_preCallbacks->{$command};
   }
 }
 
@@ -359,9 +381,9 @@ sub removePreCallbacks {
   my ($self,$p_commands,$priority)=@_;
   $priority=caller() unless(defined $priority);
   foreach my $command (@{$p_commands}) {
-    if(exists $self->{preCallbacks}->{$command}) {
-      delete $self->{preCallbacks}->{$command}->{$priority};
-      delete $self->{preCallbacks}->{$command} unless(%{$self->{preCallbacks}->{$command}});
+    if(exists $self->{preCallbacks}{$command}) {
+      delete $self->{preCallbacks}{$command}{$priority};
+      delete $self->{preCallbacks}{$command} unless(%{$self->{preCallbacks}{$command}});
     }
   }
 }
@@ -398,7 +420,7 @@ sub close {
     close($self->{autoHostSock});
     undef $self->{autoHostSock};
   }
-  $self->{state}=0;
+  $self->{state}=SRV_STATE_NOT_RUNNING;
   $self->{players}={};
   $self->{gameId}='';
   $self->{demoName}='';
@@ -461,67 +483,70 @@ sub receiveCommand {
   }
   my $autoHostSock=$self->{autoHostSock};
   my $recvBuf;
-  $autoHostSock->recv($recvBuf,4096);
-  $recvBuf="" unless(defined $recvBuf);
-  if($recvBuf eq "") {
-    $sl->log("Empty message received on AutoHost interface",2);
+  $autoHostSock->recv($recvBuf,MTU_LOCALHOST);
+  if(! defined $recvBuf) {
+    $sl->log("Error while receiving message on AutoHost interface: $!",2);
+    return 0;
+  }
+  if($recvBuf eq '') {
+    $sl->log('Empty message received on AutoHost interface',2);
     return 0;
   }
   {
     no warnings 'utf8';
-    $sl->log("Received from Game server: \"$recvBuf\"",5);
+    $sl->log("Received from game server: \"$recvBuf\"",5);
   }
-  my $p_commands=$self->unmarshallCommands($recvBuf);
-  my $rc=1;
-  for my $cIndex (0..$#{$p_commands}) {
-    my $p_command=$p_commands->[$cIndex];
-    $sl->log(" --> unmarshalled as:\"".join(",",@{$p_command})."\"",5);
-    my $commandName=$p_command->[0];
-    my $processed=0;
+  my $p_command=$self->unmarshallCommand($recvBuf);
+  return 0 unless(@{$p_command});
+  $sl->log(" --> unmarshalled as:\"".join(",",map {paramToString($_)} @{$p_command})."\"",5);
 
-    if(exists($self->{preCallbacks}->{'_ALL_'})) {
-      foreach my $prio (sort prioSort (keys %{$self->{preCallbacks}->{'_ALL_'}})) {
-        $processed=1;
-        my $p_preCallback=$self->{preCallbacks}->{'_ALL_'}->{$prio};
-        &{$p_preCallback}(@{$p_command}) if($p_preCallback);
-      }
-    }
-    if(exists($self->{preCallbacks}->{$commandName})) {
-      foreach my $prio (sort prioSort (keys %{$self->{preCallbacks}->{$commandName}})) {
-        $processed=1;
-        my $p_preCallback=$self->{preCallbacks}->{$commandName}->{$prio};
-        &{$p_preCallback}(@{$p_command}) if($p_preCallback);
-      }
-    }
+  my $commandName=$p_command->[0];
+  my $processed=0;
 
-    if(exists($commandHandlers{$commandName})) {
+  if(exists($self->{preCallbacks}{'_ALL_'})) {
+    foreach my $prio (sort prioSort (keys %{$self->{preCallbacks}{'_ALL_'}})) {
       $processed=1;
-      $rc = &{$commandHandlers{$commandName}}($self,@{$p_command}) && $rc if($commandHandlers{$commandName});
-    }
-
-    if(exists($self->{callbacks}->{$commandName})) {
-      foreach my $prio (sort prioSort (keys %{$self->{callbacks}->{$commandName}})) {
-        my ($callback,$nbCalls)=@{$self->{callbacks}->{$commandName}->{$prio}};
-        $processed=1;
-        if($nbCalls == 1) {
-          delete $self->{callbacks}->{$commandName}->{$prio};
-        }elsif($nbCalls > 1) {
-          $nbCalls-=1;
-          $self->{callbacks}->{$commandName}->{$prio}=[$callback,$nbCalls];
-        }
-        $rc = &{$callback}(@{$p_command}) && $rc if($callback);
-      }
-      delete $self->{callbacks}->{$commandName} unless(%{$self->{callbacks}->{$commandName}});
-    }
-
-    if(! $processed && $conf{warnForUnhandledMessages}) {
-      {
-        no warnings 'utf8';
-        $sl->log("Unexpected/unhandled command received: \"$recvBuf\"",2);
-      }
-      $rc=0;
+      my $p_preCallback=$self->{preCallbacks}{'_ALL_'}{$prio};
+      &{$p_preCallback}(@{$p_command}) if($p_preCallback);
     }
   }
+  if(exists($self->{preCallbacks}{$commandName})) {
+    foreach my $prio (sort prioSort (keys %{$self->{preCallbacks}{$commandName}})) {
+      $processed=1;
+      my $p_preCallback=$self->{preCallbacks}{$commandName}{$prio};
+      &{$p_preCallback}(@{$p_command}) if($p_preCallback);
+    }
+  }
+
+  my $rc=1;
+  if(exists($commandHandlers{$commandName})) {
+    $processed=1;
+    $rc = &{$commandHandlers{$commandName}}($self,@{$p_command}) if($commandHandlers{$commandName});
+  }
+
+  if(exists($self->{callbacks}{$commandName})) {
+    foreach my $prio (sort prioSort (keys %{$self->{callbacks}{$commandName}})) {
+      my ($callback,$nbCalls)=@{$self->{callbacks}{$commandName}{$prio}};
+      $processed=1;
+      if($nbCalls == 1) {
+        delete $self->{callbacks}{$commandName}{$prio};
+      }elsif($nbCalls > 1) {
+        $nbCalls-=1;
+        $self->{callbacks}{$commandName}{$prio}=[$callback,$nbCalls];
+      }
+      $rc = &{$callback}(@{$p_command}) && $rc if($callback);
+    }
+    delete $self->{callbacks}{$commandName} unless(%{$self->{callbacks}{$commandName}});
+  }
+
+  if(! $processed && $conf{warnForUnhandledMessages}) {
+    {
+      no warnings 'utf8';
+      $sl->log("Unexpected/unhandled command received: \"$recvBuf\"",2);
+    }
+    $rc=0;
+  }
+
   return $rc;
 };
 
@@ -529,20 +554,20 @@ sub checkGameOver {
   my $self=shift;
   my ($nbOver,$nbInProgress)=(0,0);
   foreach my $playerNb (keys %{$self->{players}}) {
-    if(defined $self->{players}->{$playerNb}->{winningAllyTeams}) {
+    if(defined $self->{players}{$playerNb}{winningAllyTeams}) {
       $nbOver++;
-    }elsif($self->{players}->{$playerNb}->{disconnectCause} < 0) {
+    }elsif($self->{players}{$playerNb}{disconnectCause} < CLI_STATE_CONNECTION_LOST) {
       $nbInProgress++;
     }
   }
-  $self->{state}=3 if($nbOver > $nbInProgress);
+  $self->{state}=SRV_STATE_GAME_OVER if($nbOver > $nbInProgress);
 }
 
 # Internal handlers ###########################################################
 
 sub serverStartedHandler {
   my $self=shift;
-  $self->{state}=1;
+  $self->{state}=SRV_STATE_SERVER_STARTED;
   $self->{gameId}='';
   $self->{demoName}='';
   return 1;
@@ -550,28 +575,29 @@ sub serverStartedHandler {
 
 sub serverQuitHandler {
   my $self=shift;
-  $self->{state}=0;
+  $self->{state}=SRV_STATE_NOT_RUNNING;
   $self->{players}={};
   return 1;
 }
 
 sub serverStartPlayingHandler {
   my ($self,undef,$gameId,$demoName)=@_;
-  $self->{state}=2;
+  $self->{state}=SRV_STATE_GAME_STARTED;
   $self->{gameId}=$gameId if(defined $gameId);
   $self->{demoName}=$demoName if(defined $demoName);
   return 1;
 }
 
 sub serverGameOverHandler {
-  my ($self,undef,undef,$playerNb,@winningAllyTeams)=@_;
+  my ($self,undef,$playerNb,$r_winningAllyTeams)=@_;
   my %conf=%{$self->{conf}};
   my $sl=$conf{simpleLog};
-  if(! exists $self->{players}->{$playerNb}) {
+  if(exists $self->{players}{$playerNb}) {
+    $self->{players}{$playerNb}{winningAllyTeams}=$r_winningAllyTeams;
+    $self->checkGameOver();
+  }else{
     $sl->log("Ignoring SERVER_GAMEOVER message on AutoHost interface (unknown player number $playerNb)",1);
   }
-  $self->{players}->{$playerNb}->{winningAllyTeams}=\@winningAllyTeams;
-  $self->checkGameOver();
   return 1;
 }
 
@@ -580,39 +606,39 @@ sub serverMessageHandler {
   my %conf=%{$self->{conf}};
   my $sl=$conf{simpleLog};
   if($msg =~ /^Connection attempt from ([^\ ]+)$/) {
-    $self->{connectingPlayer}->{name}=$1;
-    $self->{connectingPlayer}->{version}="";
-    $self->{connectingPlayer}->{address}="";
+    $self->{connectingPlayer}{name}=$1;
+    $self->{connectingPlayer}{version}='';
+    $self->{connectingPlayer}{address}='';
   }elsif($msg =~ /^ -> Version: (.*)$/) {
-    $self->{connectingPlayer}->{version}=$1;
+    $self->{connectingPlayer}{version}=$1;
   }elsif($msg =~ /^ -> Address: (.*)$/) {
-    $self->{connectingPlayer}->{address}=$1;
+    $self->{connectingPlayer}{address}=$1;
   }elsif($msg =~ /^ -> Connection established \(given id (\d+)\)$/) {
     my $playerNb=$1;
-    if(exists $self->{players}->{$playerNb}) {
+    if(exists $self->{players}{$playerNb}) {
       if($self->{players}{$playerNb}{name} eq '~'.$self->{connectingPlayer}{name}) {
         $self->{connectingPlayer}{name}='~'.$self->{connectingPlayer}{name};
       }
-      if($self->{connectingPlayer}->{name} ne $self->{players}->{$playerNb}->{name}) {
-        $sl->log("Received a SERVER_MESSAGE command saying player \#$playerNb was $self->{connectingPlayer}->{name}, whereas PLAYER_JOINED said it was $self->{players}->{$playerNb}->{name}",1);
+      if($self->{connectingPlayer}{name} ne $self->{players}{$playerNb}{name}) {
+        $sl->log("Received a SERVER_MESSAGE command saying player \#$playerNb was $self->{connectingPlayer}{name}, whereas PLAYER_JOINED said it was $self->{players}{$playerNb}{name}",1);
       }else{
-        $self->{players}->{$playerNb}->{version}=$self->{connectingPlayer}->{version};
-        $self->{players}->{$playerNb}->{address}=$self->{connectingPlayer}->{address};
-        $self->{players}->{$playerNb}->{disconnectCause}=-2;
+        $self->{players}{$playerNb}{version}=$self->{connectingPlayer}{version};
+        $self->{players}{$playerNb}{address}=$self->{connectingPlayer}{address};
+        $self->{players}{$playerNb}{disconnectCause}=CLI_STATE_LOADING;
       }
     }else{
-      $self->{players}->{$playerNb} = { name => $self->{connectingPlayer}->{name},
-                                        disconnectCause => -2,
-                                        ready => -1,
-                                        lost => 0,
-                                        version => $self->{connectingPlayer}->{version},
-                                        address => $self->{connectingPlayer}->{address},
-                                        winningAllyTeams => undef,
-                                        playerNb => $playerNb };
+      $self->{players}{$playerNb} = { name => $self->{connectingPlayer}{name},
+                                      disconnectCause => CLI_STATE_LOADING,
+                                      ready => RDY_STATE_NOT_PLACED,
+                                      lost => 0,
+                                      version => $self->{connectingPlayer}{version},
+                                      address => $self->{connectingPlayer}{address},
+                                      winningAllyTeams => undef,
+                                      playerNb => $playerNb };
     }
-    $self->{connectingPlayer}->{name}="";
-    $self->{connectingPlayer}->{version}="";
-    $self->{connectingPlayer}->{address}="";
+    $self->{connectingPlayer}{name}='';
+    $self->{connectingPlayer}{version}='';
+    $self->{connectingPlayer}{address}='';
   }
   return 1;
 }
@@ -621,24 +647,24 @@ sub playerJoinedHandler {
   my ($self,undef,$playerNb,$name)=@_;
   my %conf=%{$self->{conf}};
   my $sl=$conf{simpleLog};
-  if(exists $self->{players}->{$playerNb}) {
+  if(exists $self->{players}{$playerNb}) {
     if($name eq '~'.$self->{players}{$playerNb}{name}) {
       $self->{players}{$playerNb}{name}='~'.$self->{players}{$playerNb}{name};
     }
-    if($name ne $self->{players}->{$playerNb}->{name}) {
-      $sl->log("Received a PLAYER_JOINED command saying player \#$playerNb was $name, whereas SERVER_MESSAGE said it was $self->{players}->{$playerNb}->{name}",1);
+    if($name ne $self->{players}{$playerNb}{name}) {
+      $sl->log("Received a PLAYER_JOINED command saying player \#$playerNb was $name, whereas SERVER_MESSAGE said it was $self->{players}{$playerNb}{name}",1);
     }else{
-      $self->{players}->{$playerNb}->{disconnectCause}=-1;
+      $self->{players}{$playerNb}{disconnectCause}=CLI_STATE_CONNECTED;
     }
   }else{
-    $self->{players}->{$playerNb} = { name => $name,
-                                      disconnectCause => -1,
-                                      ready => -1,
-                                      lost => 0,
-                                      version => '',
-                                      address => '',
-                                      winningAllyTeams => undef,
-                                      playerNb => $playerNb };
+    $self->{players}{$playerNb} = { name => $name,
+                                    disconnectCause => CLI_STATE_CONNECTED,
+                                    ready => RDY_STATE_NOT_PLACED,
+                                    lost => 0,
+                                    version => '',
+                                    address => '',
+                                    winningAllyTeams => undef,
+                                    playerNb => $playerNb };
   }
   return 1;
 }
@@ -647,8 +673,8 @@ sub playerLeftHandler {
   my ($self,undef,$playerNb,$reason)=@_;
   my %conf=%{$self->{conf}};
   my $sl=$conf{simpleLog};
-  if(exists $self->{players}->{$playerNb}) {
-    $self->{players}->{$playerNb}->{disconnectCause}=$reason;
+  if(exists $self->{players}{$playerNb}) {
+    $self->{players}{$playerNb}{disconnectCause}=$reason;
     $self->checkGameOver();
   }else{
     $sl->log("Ignoring PLAYER_LEFT message on AutoHost interface (unknown player number $playerNb)",1);
@@ -660,8 +686,8 @@ sub playerReadyHandler {
   my ($self,undef,$playerNb,$readyState)=@_;
   my %conf=%{$self->{conf}};
   my $sl=$conf{simpleLog};
-  if(exists $self->{players}->{$playerNb}) {
-    $self->{players}->{$playerNb}->{ready}=$readyState;
+  if(exists $self->{players}{$playerNb}) {
+    $self->{players}{$playerNb}{ready}=$readyState;
   }else{
     $sl->log("Ignoring PLAYER_READY message on AutoHost interface (unknown player number $playerNb)",1);
   }
@@ -672,8 +698,8 @@ sub playerDefeatedHandler {
   my ($self,undef,$playerNb)=@_;
   my %conf=%{$self->{conf}};
   my $sl=$conf{simpleLog};
-  if(exists $self->{players}->{$playerNb}) {
-    $self->{players}->{$playerNb}->{lost}=1;
+  if(exists $self->{players}{$playerNb}) {
+    $self->{players}{$playerNb}{lost}=1;
   }else{
     $sl->log("Ignoring PLAYER_DEFEATED message on AutoHost interface (unknown player number $playerNb)",1);
   }
