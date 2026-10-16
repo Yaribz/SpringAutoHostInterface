@@ -35,3 +35,4 @@ SpringAutoHostInterface.pm:
       use constants to ease handling of server states, clients states, players ready states, and specific parameter values for engine messages
       factorize and improve unmarshalling code (avoid unneeded conversion to array of bytes and superfluous packing/unpacking operations, add checks on message length)
       remove superfluous dereference operators
+0.16: new generic Lua message management system: custom messages registry, optimized message recognition, and support for most commonly used compression and serialization formats

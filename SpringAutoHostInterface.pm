@@ -24,6 +24,10 @@ use warnings;
 
 use Encode qw'decode encode';
 use IO::Socket::INET;
+use IO::Uncompress::Inflate qw'inflate $InflateError';
+use JSON::PP 'decode_json';
+use List::Util 'first';
+use MIME::Base64 'decode_base64url';
 use Storable "dclone";
 
 use base 'Exporter';
@@ -35,6 +39,7 @@ our %EXPORT_TAGS = (
   msgDest => [qw'MSG_DEST_ALLIES MSG_DEST_SPECTATORS MSG_DEST_EVERYONE MSG_DEST_SERVER'],
   luaScript => [qw'LUA_SCRIPT_RULES LUA_SCRIPT_GAIA LUA_SCRIPT_UI'],
   luaMode => [qw'LUA_MODE_ALL LUA_MODE_ALLIES LUA_MODE_SPECTATORS'],
+  luaPreproc => [qw'LUA_PREPROC_NONE LUA_PREPROC_NOPARAM LUA_PREPROC_BASE64 LUA_PREPROC_ZLIB LUA_PREPROC_JSON'],
     );
 
 push(@{$EXPORT_TAGS{all}},@{$EXPORT_TAGS{$_}}) foreach(keys %EXPORT_TAGS);
@@ -82,11 +87,18 @@ use constant {
   LUA_MODE_ALL => 0,
   LUA_MODE_ALLIES => ord('a'),
   LUA_MODE_SPECTATORS => ord('s'),
+
+  LUA_PREPROC_NONE => 0,    # No preprocessing for parameter
+  LUA_PREPROC_NOPARAM => 1, # No parameter
+  LUA_PREPROC_BASE64 => 2,  # Parameter must be decoded using Base64URL
+  LUA_PREPROC_ZLIB => 4,    # Parameter must be uncompressed using zlib
+  LUA_PREPROC_JSON => 8,    # Parameter must be parsed as JSON
+  MAX_VALID_LUA_PREPROC => 14,
 };
 
 # Internal data ###############################################################
 
-our $VERSION='0.15';
+our $VERSION='0.16';
 
 my %commandTypes = (
   0 => {
@@ -169,7 +181,8 @@ my %commandHandlers = (
   PLAYER_JOINED => \&playerJoinedHandler,
   PLAYER_LEFT => \&playerLeftHandler,
   PLAYER_READY => \&playerReadyHandler,
-  PLAYER_DEFEATED => \&playerDefeatedHandler
+  PLAYER_DEFEATED => \&playerDefeatedHandler,
+  GAME_LUAMSG => \&gameLuaMsgHandler,
 );
 
 # Constructor #################################################################
@@ -205,7 +218,13 @@ sub new {
     players => {},
     callbacks => {},
     preCallbacks => {},
-    connectingPlayer => { name => '', version => '', address => '' }
+    connectingPlayer => { name => '', version => '', address => '' },
+    luaMsgRegistry => {},
+    luaMsgProcessOrder => {
+      LUA_SCRIPT_RULES() => [],
+      LUA_SCRIPT_GAIA() => [],
+      LUA_SCRIPT_UI() => [],
+    },
   };
 
   bless ($self, $class);
@@ -386,6 +405,156 @@ sub removePreCallbacks {
       delete $self->{preCallbacks}{$command} unless(%{$self->{preCallbacks}{$command}});
     }
   }
+}
+
+sub registerLuaMsg {
+  my ($self,$msgName,$msgScript,$msgPrefix,$valStrLength,$paramPreproc,$r_parsingFunction,$expectedFrequency)=@_;
+  $valStrLength//=0;
+  $paramPreproc//=LUA_PREPROC_NONE;
+  $expectedFrequency//=0;
+  
+  my ($failureReason,$errorLevel);
+  if(exists $self->{luaMsgRegistry}{$msgName}) {
+    $failureReason='message is already registered';
+    $errorLevel=2;
+  }elsif(! exists $self->{luaMsgProcessOrder}{$msgScript}) {
+    $failureReason="invalid Lua script \"$msgScript\"";
+    $errorLevel=1;
+  }elsif($paramPreproc !~ /^\d+$/ || $paramPreproc > MAX_VALID_LUA_PREPROC) {
+    $failureReason="invalid preprocessing mode \"$paramPreproc\"";
+    $errorLevel=1;
+  }
+  if(defined $failureReason) {
+    $self->{conf}{simpleLog}->log("Unable to register Lua message \"$msgName\", $failureReason",$errorLevel);
+    return 0;
+  }
+
+  $self->{luaMsgRegistry}{$msgName} = [
+    $msgName,
+    $msgScript,
+    ref $msgPrefix ? $msgPrefix : [$msgPrefix],
+    $valStrLength,
+    $paramPreproc,
+    $r_parsingFunction,
+    $expectedFrequency,
+    [],
+      ];
+
+  return 1;
+}
+
+sub unregisterLuaMsg {
+  my ($self,$msgName,$force)=@_;
+
+  my $sl=$self->{conf}{simpleLog};
+  if(! exists $self->{luaMsgRegistry}{$msgName}) {
+    $sl->log("Unable to unregister Lua message \"$msgName\", message is not registered",2);
+    return 0;
+  }
+
+  my $nbActiveHandlers=@{$self->{luaMsgRegistry}{$msgName}[7]};
+  if($nbActiveHandlers) {
+    if(! $force) {
+      $sl->log("Unable to unregister Lua message \"$msgName\", message has $nbActiveHandlers active handler".($nbActiveHandlers>1?'s':''),2);
+      return 0;
+    }
+    my $r_processOrder=$self->{luaMsgProcessOrder}{$self->{luaMsgRegistry}{$msgName}[1]};
+    splice(@{$r_processOrder},
+           (first {$r_processOrder->[$_][0] eq $msgName} (0..$#{$r_processOrder})),
+           1);
+  }
+
+  delete $self->{luaMsgRegistry}{$msgName};
+
+  return 1+$nbActiveHandlers;
+}
+
+sub addLuaMsgHandler {
+  my ($self,$msgName,$r_handler,$priority)=@_;
+  $priority=caller() unless(defined $priority);
+
+  my $sl=$self->{conf}{simpleLog};
+  if(! exists $self->{luaMsgRegistry}{$msgName}) {
+    $sl->log("Unable to add handler for Lua message \"$msgName\", message is not registered",2);
+    return 0;
+  }
+
+  my $r_msgHandlers=$self->{luaMsgRegistry}{$msgName}[7];
+  if(@{$r_msgHandlers}) {
+    my $insertIdx=0;
+    while($insertIdx < @{$r_msgHandlers}) {
+      my $prioComp = _compareHandlerPriority($r_msgHandlers->[$insertIdx][1],$priority);
+      if(! $prioComp) {
+        $sl->log("Unable to add handler for Lua message \"$msgName\", message already has a handler with priority \"$priority\"",2);
+        return 0;
+      }
+      last if($prioComp > 0);
+      $insertIdx++;
+    }
+    splice(@{$r_msgHandlers},$insertIdx,0,[$r_handler,$priority]);
+  }else{
+    push(@{$r_msgHandlers},[$r_handler,$priority]);
+    my ($msgScript,$msgExpectedFrequency)=@{$self->{luaMsgRegistry}{$msgName}}[1,6];
+    my $r_processOrder=$self->{luaMsgProcessOrder}{$msgScript};
+    if($msgExpectedFrequency) {
+      my $insertIdx=0;
+      while($insertIdx < @{$r_processOrder}
+            && $r_processOrder->[$insertIdx][6] > $msgExpectedFrequency) {
+        $insertIdx++;
+      }
+      splice(@{$r_processOrder},$insertIdx,0,$self->{luaMsgRegistry}{$msgName});
+    }else{
+      push(@{$r_processOrder},$self->{luaMsgRegistry}{$msgName});
+    }
+  }
+
+  return 1;
+}
+
+sub removeLuaMsgHandler {
+  my ($self,$msgName,$priority)=@_;
+  $priority=caller() unless(defined $priority);
+
+  my $sl=$self->{conf}{simpleLog};
+  if(! exists $self->{luaMsgRegistry}{$msgName}) {
+    $sl->log("Unable to remove handler for Lua message \"$msgName\", message is not registered",2);
+    return 0;
+  }
+
+  my $handlerRemoved=0;
+  my $r_msgHandlers=$self->{luaMsgRegistry}{$msgName}[7];
+  for my $handlerIdx (0..$#{$r_msgHandlers}) {
+    my $prioComp = _compareHandlerPriority($r_msgHandlers->[$handlerIdx][1],$priority);
+    if(! $prioComp) {
+      splice(@{$r_msgHandlers},$handlerIdx,1);
+      $handlerRemoved=1;
+      last;
+    }
+    last if($prioComp > 0);
+  }
+  if(! $handlerRemoved) {
+    $sl->log("Unable to remove handler for Lua message \"$msgName\" with priority \"$priority\", handler not found",2);
+    return 0;
+  }
+
+  if(! @{$r_msgHandlers}) {
+    my $r_processOrder=$self->{luaMsgProcessOrder}{$self->{luaMsgRegistry}{$msgName}[1]};
+    splice(@{$r_processOrder},
+           (first {$r_processOrder->[$_][0] eq $msgName} (0..$#{$r_processOrder})),
+           1);
+  }
+
+  return 1;
+}
+
+sub _compareHandlerPriority {
+  my ($p1,$p2)=@_;
+  if($p1 =~ /^\d+$/) {
+    return $p1 <=> $p2 if($p2 =~ /^\d+$/);
+    return $p1 <=> 1000.1;
+  }
+  return 1000.1 <=> $p2 if($p2 =~ /^\d+$/);  
+  return $p1 cmp $p2;
 }
 
 sub open {
@@ -704,6 +873,95 @@ sub playerDefeatedHandler {
     $sl->log("Ignoring PLAYER_DEFEATED message on AutoHost interface (unknown player number $playerNb)",1);
   }
   return 1;
+}
+
+sub gameLuaMsgHandler {
+  my ($self,undef,$playerNb,$luaScript,$luaMode,$luaMsg)=@_;
+
+  my $r_processOrder=$self->{luaMsgProcessOrder}{$luaScript};
+  return unless(defined $r_processOrder);
+
+  foreach my $r_msgData (@{$r_processOrder}) {
+    my ($msgName,$r_msgPrefixes,$validationStrLength)=@{$r_msgData}[0,2,3];
+
+    my ($validationStrIsOptional,$validationStrIsBeforePrefix);
+    if(ref $validationStrLength) {
+      $validationStrIsOptional=1;
+      $validationStrLength=$validationStrLength->[0];
+    }elsif($validationStrLength < 0) {
+      $validationStrIsBeforePrefix=1;
+      $validationStrLength=-$validationStrLength;
+    }
+
+    foreach my $prefix (@{$r_msgPrefixes}) {
+
+      my ($msgParam,$validationStr);
+      if($validationStrIsBeforePrefix) {
+        next unless($luaMsg =~ /^(\w{$validationStrLength})\Q$prefix\E(.*)$/s);
+        ($validationStr,$msgParam)=($1,$2);
+      }else{
+        next unless($luaMsg =~ /^\Q$prefix\E(.*)$/s);
+        $msgParam=$1;
+      }
+
+      my $decodeErr;
+      if($validationStrLength && ! defined $validationStr) {
+        my $msgParamLength=length($msgParam);
+        if($msgParamLength) {
+          if($msgParamLength < $validationStrLength) {
+            $decodeErr='insufficient data for validation string';
+          }else{
+            $validationStr=substr($msgParam,0,$validationStrLength,'');
+          }
+        }elsif(! $validationStrIsOptional) {
+          $decodeErr='missing validation string';
+        }
+      }
+
+      my $parsedMsgParam;
+      if(! defined $decodeErr) {
+        my ($paramPreproc,$r_parsingFunction)=@{$r_msgData}[4,5];
+
+        if(! $paramPreproc) {
+          $parsedMsgParam=$msgParam;
+        }elsif($paramPreproc & LUA_PREPROC_NOPARAM) {
+          $decodeErr='unexpected data'
+              if(length($msgParam));
+        }else{
+          if($paramPreproc & LUA_PREPROC_BASE64) {
+            $parsedMsgParam=decode_base64url($msgParam);
+          }else{
+            $parsedMsgParam=$msgParam;
+          }
+          if($paramPreproc & LUA_PREPROC_ZLIB) {
+            my $inflatedParam;
+            if(inflate(\$parsedMsgParam,\$inflatedParam)) {
+              $parsedMsgParam=$inflatedParam;
+            }else{
+              $decodeErr = $InflateError // 'unable to decompress data';
+            }
+          }
+          if(! defined $decodeErr
+             && $paramPreproc & LUA_PREPROC_JSON) {
+            eval { $parsedMsgParam = decode_json($parsedMsgParam); 1 }
+              or do { $decodeErr=$@; chomp($decodeErr) };
+          }
+        }
+
+        ($parsedMsgParam,$decodeErr)=$r_parsingFunction->($parsedMsgParam,$prefix)
+            if(! defined $decodeErr && defined $r_parsingFunction);
+      }
+
+      if(defined $decodeErr) {
+        $self->{conf}{simpleLog}->log("Failed to decode Lua data for $msgName Lua message".($decodeErr eq '' ? '' : " ($decodeErr)"),2);
+      }else{
+        $_->[0]($playerNb,$luaScript,$luaMode,$msgName,$parsedMsgParam,$validationStr)
+            foreach(@{$r_msgData->[7]});
+      }
+
+      return;
+    }
+  }
 }
 
 1;
